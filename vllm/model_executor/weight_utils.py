@@ -298,3 +298,196 @@ def initialize_dummy_weights(
     for param in model.state_dict().values():
         if torch.is_floating_point(param):
             param.data.uniform_(low, high)
+
+
+import time
+import boto3
+from google.cloud import storage
+from huggingface_hub import hf_hub_download
+
+HF_PREFIX = "hf://"
+MODEL_DIR = "/tmp/vllm_model"
+
+
+def prepare_hf_model_weights_on_the_fly(
+    model_name_or_path: str,
+    cache_dir: Optional[str] = None,
+    use_safetensors: bool = False,
+    fall_back_to_pt: bool = True,
+    revision: Optional[str] = None,
+) -> Tuple[List[str], bool]:
+    logger.info("Loading weights on the fly.")
+    lock = get_lock(model_name_or_path, cache_dir)
+
+    hf_weights_files = []
+    if use_safetensors:
+        logger.info("Looking for .safetensors files")
+        index_filename = "model.safetensors.index.json"
+        allow_patterns = "*.safetensors"
+    else:
+        logger.info("Looking for .bin files")
+        index_filename = "pytorch_model.bin.index.json"
+        allow_patterns = "*.bin"
+    if not os.path.isdir(model_name_or_path):
+        try:
+            with lock:
+                index_file = hf_hub_download(repo_id=model_name_or_path,
+                                             filename=index_filename,
+                                             cache_dir=cache_dir)
+        except:
+            logger.info(
+                "The model is in HF hub with 1 file, download it directly.")
+            with lock:
+                hf_folder = snapshot_download(repo_id=model_name_or_path,
+                                              allow_patterns=allow_patterns,
+                                              cache_dir=cache_dir,
+                                              tqdm_class=Disabledtqdm)
+            hf_weights_files = [
+                x for x in glob.glob(os.path.join(hf_folder, allow_patterns))
+            ]
+        else:
+            logger.info(
+                "The model is in HF hub with multiple files, do not download it now."
+            )
+            with open(index_file, "r") as f:
+                index = json.loads(f.read())
+            weight_filenames = set(index["weight_map"].values())
+            hf_weights_files = [
+                f"{HF_PREFIX}{model_name_or_path}/{weight_filename}"
+                for weight_filename in weight_filenames
+            ]
+    else:
+        logger.info("The model is possibly in local disk.")
+        hf_weights_files = [
+            x for x in glob.glob(
+                os.path.join(model_name_or_path, allow_patterns))
+        ]
+
+    if not use_safetensors:
+        # Exclude files that are not needed for inference.
+        # https://github.com/huggingface/transformers/blob/v4.34.0/src/transformers/trainer.py#L227-L233
+        blacklist = [
+            "training_args.bin",
+            "optimizer.bin",
+            "optimizer.pt",
+            "scheduler.pt",
+            "scaler.pt",
+        ]
+        hf_weights_files = [
+            f for f in hf_weights_files
+            if not any(f.endswith(x) for x in blacklist)
+        ]
+    hf_weights_files.sort()
+
+    if not hf_weights_files and use_safetensors:
+        return prepare_hf_model_weights_on_the_fly(model_name_or_path,
+                                                   cache_dir=cache_dir,
+                                                   use_safetensors=False,
+                                                   fall_back_to_pt=False,
+                                                   revision=revision)
+    if not hf_weights_files:
+        raise RuntimeError(f"No weight files found in {model_name_or_path}")
+    logger.info(f"Fetched weight files: {hf_weights_files}")
+    return hf_weights_files, use_safetensors
+
+
+def hf_model_weights_iterator_download_on_the_fly(
+    model_name_or_path: str,
+    cache_dir: Optional[str] = None,
+    load_format: str = "auto",
+    revision: Optional[str] = None,
+    fall_back_to_pt: Optional[bool] = True,
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    lock = get_lock(model_name_or_path, cache_dir)
+    hf_weights_files, use_safetensors = prepare_hf_model_weights_on_the_fly(
+        model_name_or_path=model_name_or_path,
+        cache_dir=cache_dir,
+        use_safetensors=True,
+        fall_back_to_pt=fall_back_to_pt,
+        revision=revision)
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    for hf_weight_file in hf_weights_files:
+        delete_download = False
+
+        if os.path.exists(hf_weight_file):
+            prefix = open(hf_weight_file, "rb").read(2)
+            # Download from GCS.
+            if prefix == b"gs":
+                gcs_path = open(hf_weight_file).read()
+                hf_weight_filename = gcs_path.split("/")[-1]
+                local_file = os.path.join(MODEL_DIR, hf_weight_filename)
+                with lock:
+                    if not os.path.exists(local_file):
+                        client = storage.Client()
+                        with open(local_file, 'wb') as f:
+                            logger.info(
+                                f"Download {gcs_path} to {hf_weight_file}")
+                            client.download_blob_to_file(gcs_path, f)
+                hf_weight_file = local_file
+                delete_download = True
+            # Download from S3.
+            elif prefix == b"s3":
+                s3_path = open(hf_weight_file).read()
+                hf_weight_filename = s3_path.split("/")[-1]
+                local_file = os.path.join(MODEL_DIR, hf_weight_filename)
+
+                bucket_name = s3_path.split('/')[2]
+                obj_key = s3_path.split(bucket_name)[1][1:]
+                with lock:
+                    if not os.path.exists(local_file):
+                        access_key_id = os.environ['AWS_ACCESS_KEY_ID']
+                        secret_key = os.environ['AWS_SECRET_ACCESS_KEY']
+                        client = boto3.client(
+                            's3',
+                            aws_access_key_id=access_key_id,
+                            aws_secret_access_key=secret_key,
+                        )
+                        with open(local_file, 'wb') as f:
+                            logger.info(
+                                f"Download {s3_path} to {hf_weight_file}")
+                            client.download_fileobj(bucket_name, obj_key, f)
+                hf_weight_file = local_file
+                delete_download = True
+
+        else:
+            # Download from HF.
+            assert hf_weight_file.startswith(HF_PREFIX)
+            hf_weight_filename = os.path.basename(hf_weight_file)
+            local_file = os.path.join(MODEL_DIR, hf_weight_filename)
+            with lock:
+                if not os.path.exists(local_file):
+                    logger.info(
+                        f"Download {model_name_or_path}/{hf_weight_filename} to {local_file}"
+                    )
+                    hf_hub_download(repo_id=model_name_or_path,
+                                    filename=hf_weight_filename,
+                                    local_dir=MODEL_DIR,
+                                    local_dir_use_symlinks=False,
+                                    force_download=True)
+            hf_weight_file = local_file
+            delete_download = True
+
+        if use_safetensors:
+            with safe_open(hf_weight_file, framework="pt") as f:
+                for name in f.keys():
+                    param = f.get_tensor(name)
+                    yield name, param
+                torch.distributed.barrier()
+        else:
+            torch.distributed.barrier()
+            logger.info(f"Load {hf_weight_file} to memory.")
+            state = torch.load(hf_weight_file, map_location="cpu")
+            for name, param in state.items():
+                yield name, param
+            del state
+            torch.cuda.empty_cache()
+            torch.distributed.barrier()
+
+        if delete_download:
+            with lock:
+                if os.path.exists(hf_weight_file):
+                    logger.info(f"Delete {hf_weight_file}")
+                    os.remove(hf_weight_file)
+
+
+hf_model_weights_iterator = hf_model_weights_iterator_download_on_the_fly
