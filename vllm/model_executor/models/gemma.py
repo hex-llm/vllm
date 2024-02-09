@@ -18,12 +18,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only GoldenGate model compatible with HuggingFace weights."""
+"""Inference-only Gemma model compatible with HuggingFace weights."""
 from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import GoldenGateConfig
+from transformers import GemmaConfig
 
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.attention import PagedAttention
@@ -45,7 +45,7 @@ from vllm.sequence import SamplerOutput
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
-class GoldenGateRMSNorm(nn.Module):
+class GemmaRMSNorm(nn.Module):
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -60,7 +60,7 @@ class GoldenGateRMSNorm(nn.Module):
         return output * (1 + self.weight)
 
 
-class GoldenGateMLP(nn.Module):
+class GemmaMLP(nn.Module):
 
     def __init__(
         self,
@@ -92,7 +92,7 @@ class GoldenGateMLP(nn.Module):
         return outputs
 
 
-class GoldenGateAttention(nn.Module):
+class GemmaAttention(nn.Module):
 
     def __init__(self,
                  hidden_size: int,
@@ -167,16 +167,16 @@ class GoldenGateAttention(nn.Module):
         return output
 
 
-class GoldenGateDecoderLayer(nn.Module):
+class GemmaDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: GoldenGateConfig,
+        config: GemmaConfig,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = GoldenGateAttention(
+        self.self_attn = GemmaAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -185,15 +185,15 @@ class GoldenGateDecoderLayer(nn.Module):
             rope_theta=config.rope_theta,
             linear_method=linear_method,
         )
-        self.mlp = GoldenGateMLP(
+        self.mlp = GemmaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             linear_method=linear_method,
         )
-        self.input_layernorm = GoldenGateRMSNorm(config.hidden_size,
-                                                 eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GoldenGateRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size,
+                                            eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size,
+                                                     eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -222,11 +222,11 @@ class GoldenGateDecoderLayer(nn.Module):
         return hidden_states
 
 
-class GoldenGateModel(nn.Module):
+class GemmaModel(nn.Module):
 
     def __init__(
         self,
-        config: GoldenGateConfig,
+        config: GemmaConfig,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
@@ -237,11 +237,10 @@ class GoldenGateModel(nn.Module):
             config.hidden_size,
         )
         self.layers = nn.ModuleList([
-            GoldenGateDecoderLayer(config, linear_method)
+            GemmaDecoderLayer(config, linear_method)
             for _ in range(config.num_hidden_layers)
         ])
-        self.norm = GoldenGateRMSNorm(config.hidden_size,
-                                      eps=config.rms_norm_eps)
+        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -266,17 +265,17 @@ class GoldenGateModel(nn.Module):
         return hidden_states
 
 
-class GoldenGateForCausalLM(nn.Module):
+class GemmaForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: GoldenGateConfig,
+        config: GemmaConfig,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.linear_method = linear_method
-        self.model = GoldenGateModel(config, linear_method)
+        self.model = GemmaModel(config, linear_method)
         self.sampler = Sampler(config.vocab_size)
 
     @torch.no_grad()
@@ -312,6 +311,7 @@ class GoldenGateForCausalLM(nn.Module):
             ("qkv_proj", "v_proj", "v"),
         ]
         params_dict = dict(self.named_parameters())
+        loaded_params = set()
         for name, loaded_weight in hf_model_weights_iterator(
                 model_name_or_path, cache_dir, load_format, revision):
             for (param_name, shard_name, shard_id) in stacked_params_mapping:
@@ -330,3 +330,9 @@ class GoldenGateForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        unloaded_params = params_dict.keys() - loaded_params
+        if unloaded_params:
+            raise RuntimeError(
+                f"Some weights are not initialized from checkpoints: {unloaded_params}"
+            )
