@@ -24,7 +24,7 @@ def download_s3_dir_to_local(s3_dir: str, local_dir: str):
         return
     # s3://bucket_name/dir
     bucket_name = s3_dir.split('/')[2]
-    prefix = s3_dir[len(S3_PREFIX + bucket_name):].strip('/')
+    prefix = s3_dir[len(S3_PREFIX + bucket_name):].strip('/') + '/'
 
     access_key_id = os.environ['AWS_ACCESS_KEY_ID']
     secret_key = os.environ['AWS_SECRET_ACCESS_KEY']
@@ -45,7 +45,7 @@ def download_s3_dir_to_local(s3_dir: str, local_dir: str):
         os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
         if file_path.endswith(".bin") or file_path.endswith(".safetensors"):
             with open(local_file_path, 'w') as f:
-                f.write(f'{S3_PREFIX}{bucket_name}/{prefix}/{file_path}')
+                f.write(f'{S3_PREFIX}{bucket_name}/{prefix}{file_path}')
         else:
             print(f"==> Download {s3_dir}/{file_path} to {local_file_path}")
             client.download_file(bucket_name, name, local_file_path)
@@ -60,7 +60,7 @@ def download_gcs_dir_to_local(gcs_dir: str, local_dir: str):
         return
     # gs://bucket_name/dir
     bucket_name = gcs_dir.split('/')[2]
-    prefix = gcs_dir[len(GCS_PREFIX + bucket_name):].strip('/')
+    prefix = gcs_dir[len(GCS_PREFIX + bucket_name):].strip('/') + '/'
     client = storage.Client()
     blobs = client.list_blobs(bucket_name, prefix=prefix)
     if not blobs:
@@ -73,7 +73,7 @@ def download_gcs_dir_to_local(gcs_dir: str, local_dir: str):
         os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
         if file_path.endswith(".bin") or file_path.endswith(".safetensors"):
             with open(local_file_path, 'w') as f:
-                f.write(f'{GCS_PREFIX}{bucket_name}/{prefix}/{file_path}')
+                f.write(f'{GCS_PREFIX}{bucket_name}/{prefix}{file_path}')
         else:
             print(f"==> Download {gcs_dir}/{file_path} to {local_file_path}")
             blob.download_to_filename(local_file_path)
