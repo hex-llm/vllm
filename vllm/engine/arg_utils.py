@@ -5,6 +5,78 @@ from typing import Optional, Tuple
 
 from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig, LoRAConfig)
+from vllm.logger import init_logger
+import os
+from google.cloud import storage
+import boto3
+
+logger = init_logger(__name__)
+GCS_PREFIX = "gs://"
+S3_PREFIX = "s3://"
+
+
+def is_s3_path(input_path: str) -> bool:
+    return input_path.startswith(S3_PREFIX)
+
+
+def download_s3_dir_to_local(s3_dir: str, local_dir: str):
+    if os.path.isdir(local_dir):
+        return
+    # s3://bucket_name/dir
+    bucket_name = s3_dir.split('/')[2]
+    prefix = s3_dir[len(S3_PREFIX + bucket_name):].strip('/') + '/'
+
+    access_key_id = os.environ['AWS_ACCESS_KEY_ID']
+    secret_key = os.environ['AWS_SECRET_ACCESS_KEY']
+    client = boto3.client(
+        's3',
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_key,
+    )
+    blobs = client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+    if not blobs:
+        raise ValueError(f"No blobs found in {s3_dir}")
+    for blob in blobs['Contents']:
+        name = blob['Key']
+        if name[-1] == '/':
+            continue
+        file_path = name[len(prefix):].strip('/')
+        local_file_path = os.path.join(local_dir, file_path)
+        os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+        if file_path.endswith(".bin") or file_path.endswith(".safetensors"):
+            with open(local_file_path, 'w') as f:
+                f.write(f'{S3_PREFIX}{bucket_name}/{prefix}{file_path}')
+        else:
+            print(f"==> Download {s3_dir}/{file_path} to {local_file_path}")
+            client.download_file(bucket_name, name, local_file_path)
+
+
+def is_gcs_path(input_path: str) -> bool:
+    return input_path.startswith(GCS_PREFIX)
+
+
+def download_gcs_dir_to_local(gcs_dir: str, local_dir: str):
+    if os.path.isdir(local_dir):
+        return
+    # gs://bucket_name/dir
+    bucket_name = gcs_dir.split('/')[2]
+    prefix = gcs_dir[len(GCS_PREFIX + bucket_name):].strip('/') + '/'
+    client = storage.Client()
+    blobs = client.list_blobs(bucket_name, prefix=prefix)
+    if not blobs:
+        raise ValueError(f"No blobs found in {gcs_dir}")
+    for blob in blobs:
+        if blob.name[-1] == '/':
+            continue
+        file_path = blob.name[len(prefix):].strip('/')
+        local_file_path = os.path.join(local_dir, file_path)
+        os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+        if file_path.endswith(".bin") or file_path.endswith(".safetensors"):
+            with open(local_file_path, 'w') as f:
+                f.write(f'{GCS_PREFIX}{bucket_name}/{prefix}{file_path}')
+        else:
+            print(f"==> Download {gcs_dir}/{file_path} to {local_file_path}")
+            blob.download_to_filename(local_file_path)
 
 
 @dataclass
@@ -47,6 +119,12 @@ class EngineArgs:
     device: str = 'cuda'
 
     def __post_init__(self):
+        if not self.model:
+            self.model = os.environ.get("AIP_STORAGE_URI", "")
+            logger.info(f"Load self.model from AIP_STORAGE_URI: {self.model}.")
+        if not self.model:
+            raise ValueError("self.model is must be set.")
+
         if self.tokenizer is None:
             self.tokenizer = self.model
 
@@ -62,7 +140,7 @@ class EngineArgs:
         parser.add_argument(
             '--model',
             type=str,
-            default='facebook/opt-125m',
+            default=None,
             help='name or path of the huggingface model to use')
         parser.add_argument(
             '--tokenizer',
@@ -281,10 +359,40 @@ class EngineArgs:
         engine_args = cls(**{attr: getattr(args, attr) for attr in attrs})
         return engine_args
 
+    def process_gcs(self):
+        # Download GCS tokenizer.
+        if is_gcs_path(self.tokenizer) and self.tokenizer != self.model:
+            local_dir = "/tmp/gcs_tokenizer"
+            download_gcs_dir_to_local(self.tokenizer, local_dir)
+            self.tokenizer = local_dir
+        # Download GCS model without bin files.
+        if is_gcs_path(self.model):
+            local_dir = "/tmp/gcs_model"
+            download_gcs_dir_to_local(self.model, local_dir)
+            if self.tokenizer == self.model:
+                self.tokenizer = local_dir
+            self.model = local_dir
+
+    def process_s3(self):
+        # Download S3 tokenizer.
+        if is_s3_path(self.tokenizer) and self.tokenizer != self.model:
+            local_dir = "/tmp/s3_tokenizer"
+            download_s3_dir_to_local(self.tokenizer, local_dir)
+            self.tokenizer = local_dir
+        # Download S3 model without bin files.
+        if is_s3_path(self.model):
+            local_dir = "/tmp/s3_model"
+            download_s3_dir_to_local(self.model, local_dir)
+            if self.tokenizer == self.model:
+                self.tokenizer = local_dir
+            self.model = local_dir
+
     def create_engine_configs(
         self,
     ) -> Tuple[ModelConfig, CacheConfig, ParallelConfig, SchedulerConfig,
                DeviceConfig, Optional[LoRAConfig]]:
+        self.process_gcs()
+        self.process_s3()
         device_config = DeviceConfig(self.device)
         model_config = ModelConfig(
             self.model, self.tokenizer, self.tokenizer_mode,

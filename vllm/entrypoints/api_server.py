@@ -5,6 +5,7 @@ We are also not going to accept PRs modifying this file, please change `vllm/ent
 """
 
 import argparse
+import copy
 import json
 from typing import AsyncGenerator
 
@@ -20,6 +21,17 @@ from vllm.utils import random_uuid
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 app = FastAPI()
 engine = None
+
+
+# Required by Vertex deployment.
+@app.get("/ping")
+async def ping() -> Response:
+    return Response(status_code=200)
+
+
+def format_output(prompt: str, output: str):
+    output = output.strip("\n")
+    return f"Prompt:\n{prompt.strip()}\nOutput:\n{output}"
 
 
 @app.get("/health")
@@ -38,9 +50,13 @@ async def generate(request: Request) -> Response:
     - other fields: the sampling parameters (See `SamplingParams` for details).
     """
     request_dict = await request.json()
+    is_on_vertex = "instances" in request_dict
+    if is_on_vertex:
+        request_dict = request_dict["instances"][0]
     prompt = request_dict.pop("prompt")
     prefix_pos = request_dict.pop("prefix_pos", None)
     stream = request_dict.pop("stream", False)
+    raw_response = request_dict.pop("raw_response", False)
     sampling_params = SamplingParams(**request_dict)
     request_id = random_uuid()
 
@@ -51,12 +67,36 @@ async def generate(request: Request) -> Response:
 
     # Streaming case
     async def stream_results() -> AsyncGenerator[bytes, None]:
+        prior_request_output = None
         async for request_output in results_generator:
-            prompt = request_output.prompt
-            text_outputs = [
-                prompt + output.text for output in request_output.outputs
-            ]
-            ret = {"text": text_outputs}
+            text_outputs = []
+            for i, output in enumerate(request_output.outputs):
+                if prior_request_output is not None:
+                    prior_output = prior_request_output.outputs[i]
+                    text_output = output.text[len(prior_output.text):]
+                else:
+                    text_output = output.text
+                text_outputs.append(text_output)
+            ret = {"predictions": text_outputs}
+            if raw_response:
+                output_token_counts = []
+                for i, output in enumerate(request_output.outputs):
+                    if prior_request_output is not None:
+                        prior_output = prior_request_output.outputs[i]
+                        output_token_count = len(output.token_ids) - len(
+                            prior_output.token_ids)
+                    else:
+                        output_token_count = len(output.token_ids)
+                    output_token_counts.append(output_token_count)
+                cumulative_logprobs = [
+                    output.cumulative_logprob
+                    for output in request_output.outputs
+                ]
+                ret.update({
+                    "output_token_counts": output_token_counts,
+                    "cumulative_logprobs": cumulative_logprobs
+                })
+            prior_request_output = copy.deepcopy(request_output)
             yield (json.dumps(ret) + "\0").encode("utf-8")
 
     if stream:
@@ -72,9 +112,26 @@ async def generate(request: Request) -> Response:
         final_output = request_output
 
     assert final_output is not None
-    prompt = final_output.prompt
-    text_outputs = [prompt + output.text for output in final_output.outputs]
-    ret = {"text": text_outputs}
+    if raw_response:
+        text_outputs = [output.text for output in final_output.outputs]
+        output_token_counts = [
+            len(output.token_ids) for output in final_output.outputs
+        ]
+        cumulative_logprobs = [
+            output.cumulative_logprob for output in final_output.outputs
+        ]
+        ret = {
+            "predictions": text_outputs,
+            "output_token_counts": output_token_counts,
+            "cumulative_logprobs": cumulative_logprobs
+        }
+    else:
+        prompt = final_output.prompt
+        text_outputs = [
+            format_output(prompt, output.text)
+            for output in final_output.outputs
+        ]
+        ret = {"predictions": text_outputs}
     return JSONResponse(ret)
 
 

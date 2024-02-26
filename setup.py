@@ -15,12 +15,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME, 
 
 ROOT_DIR = os.path.dirname(__file__)
 
-# If you are developing the C++ backend of vLLM, consider building vLLM with
-# `python setup.py develop` since it will give you incremental builds.
-# The downside is that this method is deprecated, see
-# https://github.com/pypa/setuptools/issues/917
-
-MAIN_CUDA_VERSION = "12.1"
+MAIN_CUDA_VERSION = "11.8"
 
 # Supported NVIDIA GPU architectures.
 NVIDIA_SUPPORTED_ARCHS = {"7.0", "7.5", "8.0", "8.6", "8.9", "9.0"}
@@ -194,10 +189,11 @@ def get_torch_arch_list() -> Set[str]:
     arch_list = torch_arch_list.intersection(valid_archs)
     # If none of the specified architectures are valid, raise an error.
     if not arch_list:
-        raise RuntimeError(
-            "None of the CUDA architectures in `TORCH_CUDA_ARCH_LIST` env "
+        print(
+            "None of the CUDA/ROCM architectures in `TORCH_CUDA_ARCH_LIST` env "
             f"variable ({env_arch_list}) is supported. "
-            f"Supported CUDA architectures are: {valid_archs}.")
+            f"Supported CUDA/ROCM architectures are: {valid_archs}.")
+        return None
     invalid_arch_list = torch_arch_list - valid_archs
     if invalid_arch_list:
         warnings.warn(
